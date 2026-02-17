@@ -43,6 +43,14 @@ class Duration:
     The unit associated with the :data:`value`.
     """
 
+    def __post_init__(self):
+        """
+        Ensure unit is a proper DurationUnit enum, handling cases where it comes in as a string
+        from OmegaConf config merging.
+        """
+        if isinstance(self.unit, str):
+            self.unit = DurationUnit(self.unit)
+
     @classmethod
     def steps(cls, steps: int) -> "Duration":
         """
