@@ -2,6 +2,7 @@ from transformers import Olmo2Config, PretrainedConfig
 
 from olmo_core.doc_utils import beta_feature
 from olmo_core.nn.attention import Attention
+from olmo_core.nn.feed_forward import ActivationFunction
 from olmo_core.nn.moe.mlp import DroplessMoEMLP, MoEMLP
 from olmo_core.nn.rope import RoPEScalingConfig
 from olmo_core.nn.transformer.block import (
@@ -23,6 +24,14 @@ try:
     from transformers import Olmo3Config  # type: ignore
 except ImportError:
     Olmo3Config = None
+
+
+def _activation_to_hf_name(value: object) -> str:
+    if isinstance(value, ActivationFunction):
+        return value.value
+    if isinstance(value, str):
+        return value
+    return ActivationFunction.silu.value
 
 
 def _get_flex_olmo_config(model: MoETransformer) -> PretrainedConfig:
@@ -62,7 +71,9 @@ def _get_flex_olmo_config(model: MoETransformer) -> PretrainedConfig:
         num_hidden_layers=model.n_layers,
         num_attention_heads=block.attention.n_heads,
         num_key_value_heads=block.attention.n_kv_heads,
-        hidden_act="silu",
+        hidden_act=_activation_to_hf_name(
+            getattr(block.feed_forward_moe.experts.mlp, "activation", None)
+        ),
         max_position_embeddings=-1,
         attention_bias=block.attention.w_out.bias is not None,
         rope_theta=block.attention.rope.theta,
@@ -115,7 +126,9 @@ def get_hf_config(model: Transformer) -> PretrainedConfig:
         "num_hidden_layers": model.n_layers,
         "num_attention_heads": first_block.attention.n_heads,
         "num_key_value_heads": first_block.attention.n_kv_heads,
-        "hidden_act": "silu",
+        "hidden_act": _activation_to_hf_name(
+            getattr(first_block.feed_forward, "activation", None)
+        ),
         "max_position_embeddings": -1,
         "attention_bias": first_block.attention.w_out.bias is not None,
         "rope_theta": first_block.attention.rope.theta,

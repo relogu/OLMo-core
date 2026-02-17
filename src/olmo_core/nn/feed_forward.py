@@ -41,11 +41,18 @@ class ActivationFunction(StrEnum):
     GELU with tanh approximation, used for GeGLU.
     """
 
+    relu2 = "relu2"
+    """
+    ReLU-squared activation, used by some Arcee AFM models.
+    """
+
     def build(self) -> Callable[[torch.Tensor], torch.Tensor]:
         if self == ActivationFunction.silu:
             return F.silu
         elif self == ActivationFunction.gelu_tanh:
             return functools.partial(F.gelu, approximate="tanh")
+        elif self == ActivationFunction.relu2:
+            return lambda x: F.relu(x).square()
         else:
             raise NotImplementedError(self)
 
@@ -157,6 +164,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.hidden_size = hidden_size
+        self.activation = activation
         self.activation_fn = activation.build()
         self.w1 = nn.Linear(d_model, hidden_size, bias=bias, dtype=dtype, device=init_device)
         self.w2 = nn.Linear(hidden_size, d_model, bias=bias, dtype=dtype, device=init_device)
