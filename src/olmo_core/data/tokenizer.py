@@ -134,18 +134,17 @@ class TokenizerConfig(Config):
 
         from cached_path import cached_path
 
-        try:
-            config_path = cached_path(f"hf://{identifier}/config.json")
-        except FileNotFoundError:
-            config_path = cached_path(f"hf://{identifier}/tokenizer_config.json")
-
-        with config_path.open() as f:
-            config = json.load(f)
+        tokenizer_config_path = cached_path(f"hf://{identifier}/tokenizer_config.json")
+        with tokenizer_config_path.open() as f:
+            tokenizer_config = json.load(f)
+        model_config_path = cached_path(f"hf://{identifier}/config.json")
+        with model_config_path.open() as f:
+            model_config = json.load(f)
 
         return cls(
-            vocab_size=config["vocab_size"],
-            eos_token_id=config["eos_token_id"],
-            pad_token_id=config.get("pad_token_id", config["eos_token_id"]),
-            bos_token_id=config.get("bos_token_id"),
+            vocab_size=model_config["vocab_size"],
+            eos_token_id=model_config["eos_token_id"] if tokenizer_config.get("eos_token") else None,
+            pad_token_id=model_config.get("pad_token_id", model_config["eos_token_id"]) if tokenizer_config.get("pad_token") or tokenizer_config.get("eos_token") else None,
+            bos_token_id=model_config.get("bos_token_id") if tokenizer_config.get("bos_token") else None,
             identifier=identifier,
         )
