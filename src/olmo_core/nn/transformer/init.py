@@ -153,7 +153,11 @@ class InitMethod(StrEnum):
         elif self == InitMethod.llama_depth:
             std = std / (2 * (block_idx + 1)) ** 0.5
 
-        self._init_linear(m.w3, std=std, generator=generator)
+        # Some FeedForward implementations (e.g. UngatedFeedForward) do not
+        # provide a third linear matrix `w3`. Guard access to `w3` so that
+        # initialization works for all variants.
+        if hasattr(m, "w3"):
+            self._init_linear(m.w3, std=std, generator=generator)
 
         if self == InitMethod.normalized:
             std = std / (2 * num_blocks) ** 0.5
