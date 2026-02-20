@@ -72,6 +72,11 @@ class FeedForwardType(StrEnum):
     ➡️ :class:`NormalizedFeedForward`
     """
 
+    ungated = "ungated"
+    """
+    ➡️ :class:`UngatedFeedForward`
+    """
+
 
 @dataclass
 class FeedForwardConfig(ModuleConfig):
@@ -138,6 +143,8 @@ class FeedForwardConfig(ModuleConfig):
                         f"NormalizedFeedForward only supports 'silu' activation, got '{activation}'"
                     )
                 return NormalizedFeedForward(**kwargs)
+            elif self.name == FeedForwardType.ungated:
+                return UngatedFeedForward(**kwargs)
             else:
                 raise NotImplementedError(self.name)
         except TypeError as e:
@@ -208,6 +215,75 @@ class FeedForward(nn.Module):
                     output_layouts=output_layout, use_local_output=use_local_output
                 ),
                 "w3": colwise_parallel(),
+            },
+        )
+
+    def num_flops_per_token(self, seq_len: int) -> int:
+        del seq_len
+        # 6 FLOPs per parameter (2 ops * 3 for forward+backward)
+        return 6 * sum(p.numel() for p in self.parameters())
+
+
+class UngatedFeedForward(nn.Module):
+    """
+    Basic feed-forward module without gated activation (ReLU or ReLUSqrt).
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        hidden_size: int,
+        bias: bool = True,
+        dtype: torch.dtype = torch.float32,
+        init_device: str = "cpu",
+        activation: ActivationFunction = ActivationFunction.relu2,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.hidden_size = hidden_size
+        self.activation = activation
+        self.activation_fn = activation.build()
+        self.w1 = nn.Linear(d_model, hidden_size, bias=bias, dtype=dtype, device=init_device)
+        self.w2 = nn.Linear(hidden_size, d_model, bias=bias, dtype=dtype, device=init_device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run the feed-forward on the input ``x``.
+
+        :param x: The input of shape ``(*, d_model)``.
+        """
+        return self.w2(self.activation_fn(self.w1(x)))
+
+    def apply_tp(
+        self,
+        tp_mesh: DeviceMesh,
+        input_layout: Optional[Placement] = None,
+        output_layout: Optional[Placement] = None,
+        use_local_output: bool = True,
+        float8_enabled: bool = False,
+    ):
+        rowwise_parallel, colwise_parallel, prepare_module_input = get_tp_wrappers(
+            float8_enabled=float8_enabled
+        )
+
+        parallelize_module(
+            module=self,
+            device_mesh=tp_mesh,
+            parallelize_plan=prepare_module_input(
+                input_layouts=None if input_layout is None else (input_layout,),
+                desired_input_layouts=(Replicate(),),
+            ),
+        )
+
+        parallelize_module(
+            module=self,
+            device_mesh=tp_mesh,
+            parallelize_plan={
+                "w1": colwise_parallel(),
+                "w2": rowwise_parallel(
+                    output_layouts=output_layout, use_local_output=use_local_output
+                ),
             },
         )
 

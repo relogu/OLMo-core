@@ -98,6 +98,43 @@ def test_convert_model_type_specific_from_hf():
         )
 
 
+def test_convert_model_type_specific_arcee_from_hf_ungated():
+    hf_config = _get_olmo2_config()
+
+    hf_state = {}
+    for i in range(hf_config.num_hidden_layers):
+        hf_state.update(
+            {
+                f"model.layers.{i}.mlp.up_proj.weight": torch.randn(
+                    hf_config.intermediate_size, hf_config.hidden_size
+                ),
+                f"model.layers.{i}.mlp.down_proj.weight": torch.randn(
+                    hf_config.hidden_size, hf_config.intermediate_size
+                ),
+                f"model.layers.{i}.post_attention_layernorm.weight": torch.randn(
+                    hf_config.hidden_size
+                ),
+            }
+        )
+
+    converted_state = convert_state_from_hf(hf_config, hf_state, model_type="arcee")
+
+    for i in range(hf_config.num_hidden_layers):
+        torch.testing.assert_close(
+            converted_state[f"blocks.{i}.feed_forward.w1.weight"],
+            hf_state[f"model.layers.{i}.mlp.up_proj.weight"],
+        )
+        torch.testing.assert_close(
+            converted_state[f"blocks.{i}.feed_forward.w2.weight"],
+            hf_state[f"model.layers.{i}.mlp.down_proj.weight"],
+        )
+        torch.testing.assert_close(
+            converted_state[f"blocks.{i}.feed_forward_norm.weight"],
+            hf_state[f"model.layers.{i}.post_attention_layernorm.weight"],
+        )
+        assert f"blocks.{i}.feed_forward.w3.weight" not in converted_state
+
+
 def test_convert_state_from_hf_and_flatten():
     hf_config = _get_olmo2_config()
 
@@ -169,6 +206,75 @@ def test_convert_layers_to_hf():
             converted_state[f"model.layers.{i}.post_attention_layernorm.weight"],
             olmo_core_state[f"blocks.{i}.attention_norm.weight"],
         )
+
+
+def test_convert_model_type_specific_smollm3_to_hf():
+    hf_config = _get_olmo2_config()
+    hf_config.model_type = "smollm3"
+
+    olmo_core_state = {}
+    for i in range(hf_config.num_hidden_layers):
+        olmo_core_state.update(
+            {
+                f"blocks.{i}.attention_norm.weight": torch.randn(hf_config.hidden_size),
+                f"blocks.{i}.feed_forward_norm.weight": torch.randn(hf_config.hidden_size),
+            }
+        )
+
+    converted_state = convert_state_to_hf(hf_config, olmo_core_state)
+
+    for i in range(hf_config.num_hidden_layers):
+        torch.testing.assert_close(
+            converted_state[f"model.layers.{i}.input_layernorm.weight"],
+            olmo_core_state[f"blocks.{i}.attention_norm.weight"],
+        )
+        torch.testing.assert_close(
+            converted_state[f"model.layers.{i}.post_attention_layernorm.weight"],
+            olmo_core_state[f"blocks.{i}.feed_forward_norm.weight"],
+        )
+        assert f"model.layers.{i}.post_feedforward_layernorm.weight" not in converted_state
+
+
+def test_convert_model_type_specific_arcee_to_hf_ungated():
+    hf_config = _get_olmo2_config()
+    hf_config.model_type = "arcee"
+
+    olmo_core_state = {}
+    for i in range(hf_config.num_hidden_layers):
+        olmo_core_state.update(
+            {
+                f"blocks.{i}.feed_forward.w1.weight": torch.randn(
+                    hf_config.hidden_size, hf_config.intermediate_size
+                ),
+                f"blocks.{i}.feed_forward.w2.weight": torch.randn(
+                    hf_config.hidden_size, hf_config.intermediate_size
+                ),
+                f"blocks.{i}.attention_norm.weight": torch.randn(hf_config.hidden_size),
+                f"blocks.{i}.feed_forward_norm.weight": torch.randn(hf_config.hidden_size),
+            }
+        )
+
+    converted_state = convert_state_to_hf(hf_config, olmo_core_state)
+
+    for i in range(hf_config.num_hidden_layers):
+        torch.testing.assert_close(
+            converted_state[f"model.layers.{i}.mlp.up_proj.weight"],
+            olmo_core_state[f"blocks.{i}.feed_forward.w1.weight"],
+        )
+        torch.testing.assert_close(
+            converted_state[f"model.layers.{i}.mlp.down_proj.weight"],
+            olmo_core_state[f"blocks.{i}.feed_forward.w2.weight"],
+        )
+        torch.testing.assert_close(
+            converted_state[f"model.layers.{i}.input_layernorm.weight"],
+            olmo_core_state[f"blocks.{i}.attention_norm.weight"],
+        )
+        torch.testing.assert_close(
+            converted_state[f"model.layers.{i}.post_attention_layernorm.weight"],
+            olmo_core_state[f"blocks.{i}.feed_forward_norm.weight"],
+        )
+        assert f"model.layers.{i}.mlp.gate_proj.weight" not in converted_state
+        assert f"model.layers.{i}.post_feedforward_layernorm.weight" not in converted_state
 
 
 def test_convert_state_to_hf_and_unflatten():

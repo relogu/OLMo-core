@@ -112,6 +112,11 @@ class TransformerBlockType(StrEnum):
     ➡️ :class:`ReorderedNormTransformerBlock`
     """
 
+    peri_norm_attn = "peri_norm_attn"
+    """
+    ➡️ :class:`PeriNormAttnTransformerBlock`
+    """
+
     peri_norm = "peri_norm"
     """
     ➡️ :class:`PeriNormTransformerBlock`
@@ -198,6 +203,7 @@ class TransformerBlockConfig(ModuleConfig):
             MoEReorderedNormTransformerBlock,
             MoETransformerBlock,
             NormalizedTransformerBlock,
+            PeriNormAttnTransformerBlock,
             PeriNormTransformerBlock,
             ReorderedNormTransformerBlock,
             TransformerBlock,
@@ -220,6 +226,8 @@ class TransformerBlockConfig(ModuleConfig):
                 return LayerNormScaledTransformerBlock(**kwargs)
             elif self.name == TransformerBlockType.reordered_norm:
                 return ReorderedNormTransformerBlock(**kwargs)
+            elif self.name == TransformerBlockType.peri_norm_attn:
+                return PeriNormAttnTransformerBlock(**kwargs)
             elif self.name == TransformerBlockType.peri_norm:
                 return PeriNormTransformerBlock(**kwargs)
             elif self.name == TransformerBlockType.normalized:

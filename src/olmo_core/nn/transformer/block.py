@@ -305,6 +305,65 @@ class ReorderedNormTransformerBlock(TransformerBlock):
         return self.feed_forward_residual_stream(h, self.feed_forward_norm(self.feed_forward(h)))
 
 
+class PeriNormAttnTransformerBlock(TransformerBlock):
+    """
+    A transformer block in the style of `Peri-LN <https://arxiv.org/pdf/2502.02732>`_ but only on the attention.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        block_idx: int,
+        n_layers: int,
+        attention: AttentionConfig,
+        feed_forward: FeedForwardConfig,
+        layer_norm: LayerNormConfig,
+        dropout: float = 0.0,
+        attention_residual_alpha: float = 1.0,
+        feed_forward_residual_alpha: float = 1.0,
+        init_device: str = "cpu",
+        cache: Optional[BufferCache] = None,
+    ):
+        super().__init__(
+            d_model=d_model,
+            block_idx=block_idx,
+            n_layers=n_layers,
+            attention=attention,
+            feed_forward=feed_forward,
+            layer_norm=layer_norm,
+            dropout=dropout,
+            attention_residual_alpha=attention_residual_alpha,
+            feed_forward_residual_alpha=feed_forward_residual_alpha,
+            init_device=init_device,
+            cache=cache,
+        )
+        self.post_attention_norm = layer_norm.build(d_model, init_device=init_device)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        loss_div_factor: Optional[Union[torch.Tensor, float]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del loss_div_factor
+        h = self.attention_residual_stream(
+            x, self.post_attention_norm(self.attention(self.attention_norm(x), **kwargs))
+        )
+        return self.feed_forward_residual_stream(
+            h, self.feed_forward(self.feed_forward_norm(h))
+        )
+
+    def apply_tp(
+        self, tp_mesh: DeviceMesh, *, input_layout: Placement, float8_enabled: bool = False
+    ):
+        super().apply_tp(tp_mesh, input_layout=input_layout, float8_enabled=float8_enabled)
+        parallelize_module(
+            self.post_attention_norm, device_mesh=tp_mesh, parallelize_plan=SequenceParallel()
+        )
+
+
 class PeriNormTransformerBlock(TransformerBlock):
     """
     A transformer block in the style of `Peri-LN <https://arxiv.org/pdf/2502.02732>`_.
