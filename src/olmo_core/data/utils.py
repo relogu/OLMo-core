@@ -206,8 +206,26 @@ def iter_document_indices(
             doc_boundaries = np.logical_and(
                 mmap[:-1] == eos_token_id, mmap[1:] == bos_token_id
             ).nonzero()[0]
-            if mmap[-1] == eos_token_id:
-                doc_boundaries = np.append(doc_boundaries, mmap.shape[0] - 1)
+            # If the tokenizer advertised a BOS token but no BOS tokens actually
+            # appear in the array, fall back to EOS-only boundaries. This can
+            # happen when data was tokenized without emitting BOS tokens even
+            # though the tokenizer has a non-null `bos_token_id`.
+            if doc_boundaries.size == 0:
+                # Fallback: treat every EOS as a document boundary.
+                try:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "No BOS tokens (id=%s) found in '%s'; falling back to EOS-only boundaries",
+                        bos_token_id,
+                        data_path,
+                    )
+                except Exception:
+                    pass
+                doc_boundaries = (mmap == eos_token_id).nonzero()[0]
+            else:
+                if mmap[-1] == eos_token_id:
+                    doc_boundaries = np.append(doc_boundaries, mmap.shape[0] - 1)
         start_idx = 0
         for idx in doc_boundaries:
             end_idx = idx + 1
