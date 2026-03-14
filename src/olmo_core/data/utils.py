@@ -226,46 +226,59 @@ def iter_document_indices(
             else:
                 if mmap[-1] == eos_token_id:
                     doc_boundaries = np.append(doc_boundaries, mmap.shape[0] - 1)
-        start_idx = 0
-        for idx in doc_boundaries:
-            end_idx = idx + 1
-            yield start_idx, end_idx
-            start_idx = end_idx
-    else:
-        metadata_filename = os.path.basename(data_path).replace(".npy", ".csv.gz")
+
+        if doc_boundaries.size > 0:
+            start_idx = 0
+            for idx in doc_boundaries:
+                end_idx = idx + 1
+                yield start_idx, end_idx
+                start_idx = end_idx
+            return
+
         try:
-            metadata_path = resource_path(
-                os.path.dirname(data_path),
-                metadata_filename,
-                local_cache=local_cache,
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "No local document boundaries found in '%s'; falling back to metadata file",
+                data_path,
             )
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                f"Source metadata file '{metadata_filename}' is required to calculate document indices for '{data_path}'. "
-                "If the source data file is local (on-disk) and 'eos_token_id' and 'dtype' are provided, then the document "
-                "indices can be inferred from the source file."
-            ) from e
+        except Exception:
+            pass
 
-        total_tokens: Optional[int] = None
-        if dtype is not None:
-            total_tokens = get_file_size(data_path) // dtype(0).itemsize
+    metadata_filename = os.path.basename(data_path).replace(".npy", ".csv.gz")
+    try:
+        metadata_path = resource_path(
+            os.path.dirname(data_path),
+            metadata_filename,
+            local_cache=local_cache,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Source metadata file '{metadata_filename}' is required to calculate document indices for '{data_path}'. "
+            "If the source data file is local (on-disk) and 'eos_token_id' and 'dtype' are provided, then the document "
+            "indices can be inferred from the source file."
+        ) from e
 
-        with gzip.open(metadata_path, "rt") as f:
-            for line in f:
-                start_index_str, end_index_str, *_ = line.split(",")
-                start_index, end_index = int(start_index_str), int(end_index_str)
-                if total_tokens is not None:
-                    if start_index >= total_tokens:
-                        raise RuntimeError(
-                            f"Document start index {start_index:,d} from metadata file "
-                            f"for source '{data_path}' with {total_tokens:,d} tokens is out-of-bounds"
-                        )
-                    if end_index > total_tokens:
-                        raise RuntimeError(
-                            f"Document end index {end_index:,d} from metadata file "
-                            f"for source '{data_path}' with {total_tokens:,d} tokens is out-of-bounds"
-                        )
-                yield start_index, end_index
+    total_tokens: Optional[int] = None
+    if dtype is not None:
+        total_tokens = get_file_size(data_path) // dtype(0).itemsize
+
+    with gzip.open(metadata_path, "rt") as f:
+        for line in f:
+            start_index_str, end_index_str, *_ = line.split(",")
+            start_index, end_index = int(start_index_str), int(end_index_str)
+            if total_tokens is not None:
+                if start_index >= total_tokens:
+                    raise RuntimeError(
+                        f"Document start index {start_index:,d} from metadata file "
+                        f"for source '{data_path}' with {total_tokens:,d} tokens is out-of-bounds"
+                    )
+                if end_index > total_tokens:
+                    raise RuntimeError(
+                        f"Document end index {end_index:,d} from metadata file "
+                        f"for source '{data_path}' with {total_tokens:,d} tokens is out-of-bounds"
+                    )
+            yield start_index, end_index
 
 
 def iter_document_indices_with_max_sequence_length(
