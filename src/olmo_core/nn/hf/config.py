@@ -101,12 +101,12 @@ def get_hf_config(model: Transformer) -> PretrainedConfig:
     first_block = blocks[0]
     if not isinstance(first_block, ReorderedNormTransformerBlock):
         raise NotImplementedError(
-            f"Block is not a {ReorderedNormTransformerBlock.__name__}, unable to build HF config for {model.__class__.__name__}"
+            f"Block is a {type(first_block).__name__} and not a {ReorderedNormTransformerBlock.__name__}, unable to build HF config for {model.__class__.__name__}"
         )
 
     if not isinstance(first_block.attention, Attention):
         raise NotImplementedError(
-            f"Attention is not a {Attention.__name__}, unable to build HF config for {model.__class__.__name__}"
+            f"Attention is a {type(first_block.attention).__name__} and not a {Attention.__name__}, unable to build HF config for {model.__class__.__name__}"
         )
     if first_block.attention.rope is None:
         raise NotImplementedError(
