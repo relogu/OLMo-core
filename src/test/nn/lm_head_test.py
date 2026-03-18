@@ -29,6 +29,31 @@ def test_lm_head_builder_config():
         LMHeadConfig(name=LMHeadType.normalized, bias=True).build(d_model=64, vocab_size=128)
 
 
+def test_lm_head_zero_loss_div_factor_with_all_ignored_labels():
+    seed_all(42)
+
+    lm_head = LMHeadConfig(loss_implementation=LMLossImplementation.default).build(
+        d_model=32,
+        vocab_size=128,
+    )
+
+    inputs = torch.randn(2, 8, 32)
+    labels = torch.full((2, 8), -100, dtype=torch.long)
+    loss_div_factor = torch.tensor(0.0)
+
+    output = lm_head(
+        inputs,
+        labels=labels,
+        loss_div_factor=loss_div_factor,
+        loss_reduction="sum",
+    )
+
+    assert torch.isfinite(output.loss)
+    assert torch.isfinite(output.ce_loss)
+    assert output.loss.item() == 0.0
+    assert output.ce_loss.item() == 0.0
+
+
 @requires_gpu
 def test_lm_head_fused_linear_loss(
     d_model: int = 256,
