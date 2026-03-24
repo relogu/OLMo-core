@@ -919,6 +919,7 @@ def pack_documents_into_instances(
     eos_token_id: int,
     dtype: Union[Type[np.uint8], Type[np.uint16], Type[np.uint32], Type[np.uint64]],
     bos_token_id: Optional[int] = None,
+    use_array_if_local: Optional[bool] = None,
     indices_dtype: Union[
         Type[np.uint8], Type[np.uint16], Type[np.uint32], Type[np.uint64]
     ] = np.uint64,
@@ -934,6 +935,8 @@ def pack_documents_into_instances(
     :param eos_token_id: The EOS token ID, used to find document boundaries.
     :param bos_token_id: The BOS token ID, used to find document boundaries in conjunction with the EOS
         token ID.
+    :param use_array_if_local: Whether to infer document boundaries directly from the local token array
+        instead of the metadata sidecar when the source path is local.
     :param dtype: The numpy datatype of the source file.
     :param indices_dtype: The numpy datatype to use for document indices.
     :param long_doc_strategy: Specifies how to handle document that are longer than ``max_sequence_length``.
@@ -955,6 +958,7 @@ def pack_documents_into_instances(
             for start_idx, end_idx in iter_document_indices_with_max_sequence_length(
                 path,
                 max_sequence_length,
+                use_array_if_local=use_array_if_local,
                 eos_token_id=eos_token_id,
                 bos_token_id=bos_token_id,
                 dtype=dtype,

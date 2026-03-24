@@ -1007,6 +1007,7 @@ class NumpyPackedFSLDataset(NumpyFSLDatasetBase):
         label_mask_paths: Optional[List[PathOrStr]] = None,
         long_doc_strategy: LongDocStrategy = LongDocStrategy.truncate,
         source_group_size: int = 1,
+        use_array_if_local: Optional[bool] = None,
     ):
         super().__init__(
             *paths,
@@ -1027,6 +1028,7 @@ class NumpyPackedFSLDataset(NumpyFSLDatasetBase):
 
         self._long_doc_strategy = long_doc_strategy
         self._source_group_size = source_group_size
+        self._use_array_if_local = use_array_if_local
 
         self._source_path_groups = list(chunked(self.paths, self.source_group_size))
         self._label_mask_path_groups: Optional[List[List[PathOrStr]]] = None
@@ -1056,6 +1058,8 @@ class NumpyPackedFSLDataset(NumpyFSLDatasetBase):
         # For backwards compat, only add this when it's not the default.
         if self._source_group_size > 1:
             fields = fields + ("source_group_size",)
+        if self._use_array_if_local is not None:
+            fields = fields + ("_use_array_if_local",)
         return fields
 
     @property
@@ -1265,6 +1269,7 @@ class NumpyPackedFSLDataset(NumpyFSLDatasetBase):
             max_sequence_length=self.sequence_length,
             eos_token_id=self.eos_token_id,
             bos_token_id=self.bos_token_id,
+            use_array_if_local=self._use_array_if_local,
             dtype=self.dtype,
             indices_dtype=self.indices_dtype,
             long_doc_strategy=self._long_doc_strategy,
@@ -2672,6 +2677,11 @@ class NumpyPackedFSLDatasetConfig(NumpyDatasetConfig):
     """
     The number of source npy files to process together when packing.
     """
+    use_array_if_local: Optional[bool] = None
+    """
+    Whether to infer document boundaries directly from local token arrays instead of metadata sidecars.
+    Leave unset to preserve the dataset default.
+    """
 
     def validate(self):
         if self.sequence_length <= 0:
@@ -2701,6 +2711,7 @@ class NumpyPackedFSLDatasetConfig(NumpyDatasetConfig):
             long_doc_strategy=self.long_doc_strategy,
             label_mask_paths=label_masks,
             source_group_size=self.source_group_size,
+            use_array_if_local=self.use_array_if_local,
         )
         return self._finalize(dataset)
 
