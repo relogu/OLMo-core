@@ -19,8 +19,6 @@ from olmo_core.config import DType, StrEnum
 from olmo_core.distributed.utils import get_local_tensor
 from olmo_core.doc_utils import beta_feature
 from olmo_core.exceptions import OLMoConfigurationError
-from olmo_core.utils import log_once
-
 from .config import ModuleConfig
 from .functional import (
     cross_entropy_loss,
@@ -358,26 +356,6 @@ class LMHead(nn.Module):
             if self.cp_enabled:
                 assert self._cp_mesh is not None
                 loss_div_factor = loss_div_factor / self._cp_mesh.size()
-
-            # Prompt-only local batches can legitimately have zero valid labels after masking.
-            # Clamp the divisor so those ranks contribute a zero loss instead of NaN.
-            if isinstance(loss_div_factor, torch.Tensor):
-                if loss_div_factor.numel() == 1 and loss_div_factor.item() == 0:
-                    log_once(
-                        log,
-                        "Encountered a local batch with zero valid labels; clamping "
-                        "loss_div_factor to 1 to avoid NaNs.",
-                        level=logging.WARNING,
-                    )
-                    loss_div_factor = torch.ones_like(loss_div_factor)
-            elif loss_div_factor == 0:
-                log_once(
-                    log,
-                    "Encountered a local batch with zero valid labels; clamping "
-                    "loss_div_factor to 1 to avoid NaNs.",
-                    level=logging.WARNING,
-                )
-                loss_div_factor = 1.0
 
             # Apply divide factor.
             loss = loss / loss_div_factor
