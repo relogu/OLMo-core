@@ -1,9 +1,8 @@
 import logging
 import math
 import warnings
-from abc import abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -15,7 +14,9 @@ from olmo_core.config import Config, DType, StrEnum
 from olmo_core.distributed.parallel.tensor_parallel import SequenceParallel
 from olmo_core.doc_utils import beta_feature
 from olmo_core.exceptions import OLMoConfigurationError
+from olmo_core.nn.attention.base import SequenceMixer, SequenceMixerConfig
 from olmo_core.nn.attention.kv_cache import KVCacheManager
+from olmo_core.nn.attention.recurrent import GatedDeltaNet, GatedDeltaNetConfig
 
 from ..buffer_cache import BufferCache
 from ..config import ModuleConfig
@@ -34,6 +35,7 @@ from .backend import (
     AttentionBackendName,
     FlashAttention2Backend,
     FlashAttention3Backend,
+    FlashAttention4Backend,
     TEAttentionBackend,
     TorchAttentionBackend,
 )
@@ -47,6 +49,9 @@ from .ring import (
     UlyssesLoadBalancer,
 )
 
+if TYPE_CHECKING:
+    from olmo_core.nn.transformer.init import InitMethod
+
 __all__ = [
     "SlidingWindowAttentionConfig",
     "GateGranularity",
@@ -57,9 +62,9 @@ __all__ = [
     "TorchAttentionBackend",
     "FlashAttention2Backend",
     "FlashAttention3Backend",
+    "FlashAttention4Backend",
     "TEAttentionBackend",
     "AttentionConfig",
-    "AttentionBase",
     "Attention",
     "FusedAttention",
     "NormalizedAttention",
@@ -70,6 +75,8 @@ __all__ = [
     "UlyssesLoadBalancer",
     "RingContextParallelStyle",
     "UlyssesContextParallelStyle",
+    "GatedDeltaNetConfig",
+    "GatedDeltaNet",
 ]
 
 log = logging.getLogger(__name__)
@@ -167,8 +174,9 @@ class AttentionType(StrEnum):
     """
 
 
+@SequenceMixerConfig.register("attention")
 @dataclass
-class AttentionConfig(ModuleConfig):
+class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
     """
     A configuration class for easily building any of the different attention modules.
 
@@ -256,7 +264,7 @@ class AttentionConfig(ModuleConfig):
         n_layers: int,
         init_device: str = "cpu",
         cache: Optional[BufferCache] = None,
-    ) -> "AttentionBase":
+    ) -> "SequenceMixer":
         """
         Build the corresponding attention module.
 
@@ -309,33 +317,7 @@ class AttentionConfig(ModuleConfig):
             ) from e
 
 
-class AttentionBase(nn.Module):
-    """
-    Base class for attention modules.
-    """
-
-    @abstractmethod
-    def apply_tp(
-        self,
-        tp_mesh: DeviceMesh,
-        input_layout: Optional[Placement] = None,
-        output_layout: Optional[Placement] = None,
-        use_local_output: bool = True,
-        float8_enabled: bool = False,
-    ):
-        raise NotImplementedError
-
-    @abstractmethod
-    def apply_cp(
-        self,
-        cp_mesh: DeviceMesh,
-        ring: Optional[RingContextParallelStyle] = None,
-        uly: Optional[UlyssesContextParallelStyle] = None,
-    ):
-        raise NotImplementedError
-
-
-class Attention(AttentionBase):
+class Attention(SequenceMixer):
     """
     An implementation of multi-head self-attention with support for multi-query (MQA)
     and grouped-query (GQA) attention.
@@ -470,7 +452,7 @@ class Attention(AttentionBase):
                 raise OLMoConfigurationError(f"'window_size' must be positive (got {window_size})")
 
             if backend is None and flash_attn_api.has_flash_attn_2():
-                # note: flash_3 and te backends are faster than flash_2 and also support SWA
+                # note: flash_3, flash_4, and te backends are faster than flash_2 and also support SWA
                 backend = AttentionBackendName.flash_2
 
             # Window size is [i - window_size[0], i + window_size[1]] inclusive
@@ -720,6 +702,52 @@ class Attention(AttentionBase):
         """
         self.backend.apply_cp(cp_mesh, ring=ring, uly=uly)
 
+    def init_weights(
+        self,
+        *,
+        init_method: "InitMethod",
+        d_model: int,
+        block_idx: int,
+        num_blocks: int,
+        std: float = 0.02,
+        generator: Optional[torch.Generator] = None,
+    ) -> None:
+        from olmo_core.nn.transformer.init import InitMethod, init_linear
+
+        # Compute std for Q/K/V initialization
+        if init_method == InitMethod.fan_in:
+            # For fan_in, use 1/√d_in based on actual weight shape (ignores base std parameter)
+            # Each projection may have different output dims (n_heads * head_dim vs n_kv_heads * head_dim)
+            # but they all have the same input dim
+            for w in (self.w_q, self.w_k, self.w_v):
+                w_std = w.in_features**-0.5
+                init_linear(w, std=w_std, generator=generator)
+        else:
+            if init_method == InitMethod.normalized:
+                std = d_model**-0.5
+            for w in (self.w_q, self.w_k, self.w_v):
+                init_linear(w, std=std, generator=generator)
+
+        # Initialize attention gate projection if present
+        if self.w_g is not None:
+            if init_method == InitMethod.fan_in:
+                g_std = self.w_g.in_features**-0.5
+            else:
+                g_std = std
+            init_linear(self.w_g, std=g_std, generator=generator)
+
+        # Compute std for w_out initialization
+        if init_method == InitMethod.fan_in:
+            std = self.w_out.in_features**-0.5
+        elif init_method == InitMethod.llama:
+            std = std / (2 * num_blocks) ** 0.5
+        elif init_method == InitMethod.llama_depth:
+            std = std / (2 * (block_idx + 1)) ** 0.5
+        elif init_method == InitMethod.normalized:
+            std = std / (2 * num_blocks) ** 0.5
+
+        init_linear(self.w_out, std=std, generator=generator)
+
     def init_kv_cache_manager(self, batch_size: int, max_seq_len: int):
         """
         Initialize the kv cache manager for attention. When the kv cache manager exists,
@@ -729,6 +757,7 @@ class Attention(AttentionBase):
         :param max_seq_len: The maximum sequence length for the cache.
         """
         self.backend.assert_supports_kv_cache()
+
         self.kv_cache_manager = KVCacheManager(
             batch_size=batch_size,
             max_seq_len=max_seq_len,
@@ -924,7 +953,7 @@ class NormalizedAttention(Attention):
         w.copy_(l2_normalize(w, dim=dim))
 
 
-class FusedAttention(AttentionBase):
+class FusedAttention(SequenceMixer):
     """
     An "fused" implementation of multi-head self-attention.
 
@@ -1068,6 +1097,38 @@ class FusedAttention(AttentionBase):
         uly: Optional[UlyssesContextParallelStyle] = None,
     ):
         self.backend.apply_cp(cp_mesh, ring=ring, uly=uly)
+
+    def init_weights(
+        self,
+        *,
+        init_method: "InitMethod",
+        d_model: int,
+        block_idx: int,
+        num_blocks: int,
+        std: float = 0.02,
+        generator: Optional[torch.Generator] = None,
+    ) -> None:
+        from olmo_core.nn.transformer.init import InitMethod, init_linear
+
+        # Compute std for fused QKV initialization
+        if init_method == InitMethod.fan_in:
+            std = self.w_qkv.in_features**-0.5
+        elif init_method == InitMethod.normalized:
+            std = d_model**-0.5
+
+        init_linear(self.w_qkv, std=std, generator=generator)
+
+        # Compute std for w_out initialization
+        if init_method == InitMethod.fan_in:
+            std = self.w_out.in_features**-0.5
+        elif init_method == InitMethod.llama:
+            std = std / (2 * num_blocks) ** 0.5
+        elif init_method == InitMethod.llama_depth:
+            std = std / (2 * (block_idx + 1)) ** 0.5
+        elif init_method == InitMethod.normalized:
+            std = std / (2 * num_blocks) ** 0.5
+
+        init_linear(self.w_out, std=std, generator=generator)
 
     def num_flops_per_token(self, seq_len: int) -> int:
         # 6 FLOPs per parameter (2 ops * 3 for forward+backward)

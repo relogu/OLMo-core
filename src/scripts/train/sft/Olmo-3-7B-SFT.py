@@ -33,9 +33,8 @@ from olmo_core.internal.common import (
 )
 from olmo_core.io import copy_dir, dir_is_empty, get_parent, join_path, list_directory
 from olmo_core.launch.beaker import BeakerLaunchConfig
-from olmo_core.nn.attention import SlidingWindowAttentionConfig
 from olmo_core.nn.rope import YaRNRoPEScalingConfig
-from olmo_core.nn.transformer import TransformerBlockConfig, TransformerConfig
+from olmo_core.nn.transformer import TransformerConfig
 from olmo_core.optim import LinearWithWarmup, SkipStepAdamWConfig
 from olmo_core.train import (
     Duration,
@@ -310,30 +309,11 @@ class SFTConfig(Config):
             // (bs_config.cp_degree or 1),
         )
 
-        model = TransformerConfig.olmo2_7B(vocab_size=tokenizer_config.padded_vocab_size())
-        model.block.attention.sliding_window = SlidingWindowAttentionConfig(
-            force_full_attention_on_first_layer=False,
-            force_full_attention_on_last_layer=True,
-            pattern=[4096, 4096, 4096, -1],
+        model = TransformerConfig.olmo3_7B(
+            vocab_size=tokenizer_config.padded_vocab_size(),
+        ).with_rope_scaling(
+            YaRNRoPEScalingConfig(factor=8, beta_fast=32, beta_slow=1, old_context_len=8192)
         )
-        model.block.attention.use_flash = True
-        if model.block.attention.rope is not None:
-            model.block.attention.rope.scaling = YaRNRoPEScalingConfig(
-                factor=8, beta_fast=32, beta_slow=1, old_context_len=8192
-            )
-
-        def no_rope_scaling(block: TransformerBlockConfig) -> TransformerBlockConfig:
-            rope_config = block.attention.rope
-            if rope_config is not None:
-                rope_config.scaling = None
-                block.attention.rope = rope_config
-            return block
-
-        model.block_overrides = {
-            i: no_rope_scaling(model.block.copy())
-            for i in range(model.n_layers)
-            if model.block.attention.sliding_window.should_use_swa(i, model.n_layers)
-        }
 
         config = SFTConfig(
             run_name=run_name,
@@ -477,7 +457,7 @@ if __name__ == "__main__":
         epilog="""
 Examples:
   python %(prog)s dry_run test my-dataset-name /path/to/ckpt ai2/cluster
-  python %(prog)s launch run01 OpenThoughts3-1.2M /weka/oe-training-default/ai2-llm/checkpoints/dustins/lc_7b_cont_pretrain_final_anneal/step11921 ai2/jupiter-cirrascale-2 --seq_len=4096 --num_nodes=2 --launch.priority=high
+  python %(prog)s launch run01 OpenThoughts3-1.2M /weka/oe-training-default/ai2-llm/checkpoints/dustins/lc_7b_cont_pretrain_final_anneal/step11921 ai2/jupiter-cirrascale-2 --seq_len=4096 --num_nodes=2 --launch.priority=high  --launch.follow=false
 """,
     )
 
@@ -505,11 +485,6 @@ Examples:
     )
     parser.add_argument(
         "--num_nodes", type=int, help="The number of nodes to use.", default=DEFAULT_NUM_NODES
-    )
-    parser.add_argument(
-        "--follow",
-        action="store_true",
-        help="Whether to follow the experiment in the terminal.",
     )
     parser.add_argument(
         "--no_save_tokenizer",
@@ -560,7 +535,7 @@ Examples:
     if args.cmd == "dry_run":
         pass
     elif args.cmd == "launch":
-        config.launch.launch(follow=args.follow)
+        config.launch.launch()
     elif args.cmd == "train":
         try:
             train(args.pretrain_checkpoint, config, args.no_save_tokenizer)

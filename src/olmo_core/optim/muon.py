@@ -15,7 +15,8 @@ from olmo_core.distributed.parallel import (
     get_world_mesh,
 )
 from olmo_core.nn.transformer import Transformer
-from olmo_core.optim.config import MatrixAwareOptimConfig, OptimGroupOverride
+
+from .config import MatrixAwareOptimConfig, OptimConfig, OptimGroupOverride
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class MuonAdjustLRStrategy(StrEnum):
     """Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW (Kimi/Moonlight style: https://arxiv.org/abs/2502.16982)"""
 
 
+@OptimConfig.register("muon")
 @dataclass
 class MuonConfig(MatrixAwareOptimConfig):
     """
@@ -78,6 +80,9 @@ class MuonConfig(MatrixAwareOptimConfig):
 
     adjust_lr: MuonAdjustLRStrategy | None = MuonAdjustLRStrategy.rms_norm
     """How to adjust the learning rate for Muon updates."""
+
+    flatten: bool = False
+    """Whether to flatten 3D+ tensors to 2D for Muon updates. Use this for convolutional layers."""
 
     use_triton: bool = False
     """
@@ -214,6 +219,7 @@ class MuonConfig(MatrixAwareOptimConfig):
         return optim
 
 
+@OptimConfig.register("nor_muon")
 class NorMuonConfig(MuonConfig):
     """
     Configuration class for building a :class:`NorMuon` optimizer.

@@ -1,19 +1,22 @@
 import logging
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 from fnmatch import fnmatch
-from typing import TYPE_CHECKING, Dict, List, Optional
+from itertools import cycle, islice
+from typing import TYPE_CHECKING, Dict, List, Optional, cast
 
-from olmo_core.config import DType, StrEnum
+from olmo_core.config import UNSET, DType, StrEnum
 from olmo_core.doc_utils import beta_feature
 from olmo_core.exceptions import OLMoConfigurationError
+from olmo_core.nn.attention.base import SequenceMixerConfig
 from olmo_core.utils import ensure_multiple_of
 
 from ..attention import (
     AttentionBackendName,
     AttentionConfig,
     AttentionType,
+    GateConfig,
     SlidingWindowAttentionConfig,
 )
 from ..buffer_cache import BufferCache
@@ -154,9 +157,15 @@ class TransformerBlockConfig(ModuleConfig):
     A configuration class for easily building transformer blocks.
     """
 
-    attention: AttentionConfig
+    sequence_mixer: SequenceMixerConfig = field(default=UNSET)
     """
-    The attention config.
+    The sequence mixer config (e.g. attention, recurrent, convolution, etc.).
+    """
+    attention: InitVar[Optional[AttentionConfig]] = None
+    """
+    .. deprecated::
+        Use :data:`sequence_mixer` instead. This field is only kept for backwards compatibility
+        with old configs that used ``attention: AttentionConfig``.
     """
     layer_norm: Optional[LayerNormConfig] = None
     """
@@ -180,12 +189,26 @@ class TransformerBlockConfig(ModuleConfig):
     """
     attention_residual_alpha: Optional[float] = None
     """
-    A scaling factor applied to the attention output before adding it to the residual stream.
+    A scaling factor applied to the attention/recurrent output before adding it to the residual stream.
     """
     feed_forward_residual_alpha: Optional[float] = None
     """
     A scaling factor applied to the feed-forward (MLP) output before adding it to the residual stream.
     """
+
+    def __post_init__(self, attention: Optional[AttentionConfig] = None):
+        # Handle backwards compatibility: old configs used `attention` instead of `sequence_mixer`.
+        if attention is not None:
+            if self.sequence_mixer is not UNSET:
+                raise OLMoConfigurationError(
+                    "Cannot specify both 'attention' and 'sequence_mixer' in TransformerBlockConfig. "
+                    "Use 'sequence_mixer' only (the 'attention' field is deprecated)."
+                )
+            self.sequence_mixer = attention
+        if self.sequence_mixer is UNSET:
+            raise OLMoConfigurationError(
+                "TransformerBlockConfig requires 'sequence_mixer' to be set."
+            )
 
     def build(
         self,
@@ -255,7 +278,7 @@ class TransformerBlockConfig(ModuleConfig):
             block_params += 2 * d_model
 
         # Block attention params.
-        block_params += self.attention.num_params(d_model)
+        block_params += self.sequence_mixer.num_params(d_model)
         if self.layer_norm is not None:
             block_params += self.layer_norm.num_params(d_model)
 
@@ -300,7 +323,7 @@ class TransformerConfig(ModelConfig):
     d_model: int
     vocab_size: int
     n_layers: int
-    block: TransformerBlockConfig
+    block: TransformerBlockConfig | dict[str, TransformerBlockConfig]
     lm_head: LMHeadConfig
     embedding_norm: Optional[LayerNormConfig] = None
     name: TransformerType = TransformerType.default
@@ -308,9 +331,27 @@ class TransformerConfig(ModelConfig):
     init_method: InitMethod = InitMethod.normal
     init_seed: int = 0
     init_std: float = 0.02
+    embedding_init_std: Optional[float] = None
     freeze_params: Optional[List[str]] = None
+    block_pattern: Optional[List[str]] = None
     block_overrides: Optional[Dict[int, TransformerBlockConfig]] = None
     embed_scale: Optional[float] = None
+
+    def __post_init__(self):
+        validate_block_resolution_config(
+            n_layers=self.n_layers,
+            block=self.block,
+            block_pattern=self.block_pattern,
+            block_overrides=self.block_overrides,
+        )
+        if self.block_pattern is not None and self.n_layers % len(self.block_pattern) != 0:
+            log.warning(
+                "`n_layers` (%d) is not divisible by the length of `block_pattern` (%d). "
+                "The pattern will be cycled and truncated to fit `n_layers`, so the last "
+                "cycle will be incomplete.",
+                self.n_layers,
+                len(self.block_pattern),
+            )
 
     def build(
         self,
@@ -343,7 +384,9 @@ class TransformerConfig(ModelConfig):
                 init_device=init_device,
                 init_seed=self.init_seed,
                 init_std=self.init_std,
+                embedding_init_std=self.embedding_init_std,
                 block_overrides=self.block_overrides,
+                block_pattern=self.block_pattern,
                 embed_scale=self.embed_scale,
             )
         elif self.name == TransformerType.normalized:
@@ -359,7 +402,9 @@ class TransformerConfig(ModelConfig):
                 init_device=init_device,
                 init_seed=self.init_seed,
                 init_std=self.init_std,
+                embedding_init_std=self.embedding_init_std,
                 block_overrides=self.block_overrides,
+                block_pattern=self.block_pattern,
             )
         elif self.name == TransformerType.moe:
             model = MoETransformer(
@@ -374,7 +419,9 @@ class TransformerConfig(ModelConfig):
                 init_device=init_device,
                 init_seed=self.init_seed,
                 init_std=self.init_std,
+                embedding_init_std=self.embedding_init_std,
                 block_overrides=self.block_overrides,
+                block_pattern=self.block_pattern,
             )
         else:
             raise NotImplementedError(self.name)
@@ -400,6 +447,15 @@ class TransformerConfig(ModelConfig):
         return model
 
     @property
+    def resolved_block_configs(self) -> list[TransformerBlockConfig]:
+        return resolve_block_configs(
+            n_layers=self.n_layers,
+            block=self.block,
+            block_pattern=self.block_pattern,
+            block_overrides=self.block_overrides,
+        )
+
+    @property
     def num_params(self) -> int:
         """
         The total number of parameters that a model from this config would have.
@@ -412,15 +468,8 @@ class TransformerConfig(ModelConfig):
             num_params += self.embedding_norm.num_params(self.d_model)
 
         # All block params.
-        num_block_params = self.block.num_params(self.d_model)
-        if self.block_overrides is None:
-            num_params += self.n_layers * num_block_params
-        else:
-            for idx in range(self.n_layers):
-                if idx in self.block_overrides:
-                    num_params += self.block_overrides[idx].num_params(self.d_model)
-                else:
-                    num_params += num_block_params
+        for block_config in self.resolved_block_configs:
+            num_params += block_config.num_params(self.d_model)
 
         # LM head.
         num_params += self.lm_head.num_params(self.d_model, self.vocab_size)
@@ -440,15 +489,8 @@ class TransformerConfig(ModelConfig):
             num_active_params += self.embedding_norm.num_params(self.d_model)
 
         # All block active params.
-        num_active_block_params = self.block.num_active_params(self.d_model)
-        if self.block_overrides is None:
-            num_active_params += self.n_layers * num_active_block_params
-        else:
-            for idx in range(self.n_layers):
-                if idx in self.block_overrides:
-                    num_active_params += self.block_overrides[idx].num_active_params(self.d_model)
-                else:
-                    num_active_params += num_active_block_params
+        for block_config in self.resolved_block_configs:
+            num_active_params += block_config.num_active_params(self.d_model)
 
         # LM head.
         num_active_params += self.lm_head.num_params(self.d_model, self.vocab_size)
@@ -1418,11 +1460,13 @@ class TransformerConfig(ModelConfig):
         n_heads: int,
         n_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
+        gate: Optional[GateConfig] = None,
         qk_norm: bool = False,
         use_head_qk_norm: bool = False,
         layer_norm_eps: float = 1e-5,
         rope_theta: int = 500_000,
         rope_type: Optional[RoPEType] = None,
+        no_global_rope: bool = False,
         hidden_size_multiple_of: int = 256,
         hidden_size_multiplier: Optional[float] = None,
         fused_ops: bool = False,
@@ -1477,13 +1521,19 @@ class TransformerConfig(ModelConfig):
         # Configure blocks.
         block = TransformerBlockConfig(
             name=block_name,
-            attention=AttentionConfig(
+            sequence_mixer=AttentionConfig(
                 name=att_type,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
                 head_dim=head_dim,
                 bias=False,
-                rope=RoPEConfig(name=rope_type, theta=rope_theta, scaling=rope_scaling),
+                rope=RoPEConfig(
+                    name=rope_type,
+                    theta=rope_theta,
+                    no_global_rope=no_global_rope,
+                    scaling=rope_scaling,
+                ),
+                gate=gate,
                 qk_norm=layer_norm if qk_norm else None,
                 use_head_qk_norm=use_head_qk_norm if qk_norm else None,
                 use_flash=use_flash,
@@ -1598,7 +1648,7 @@ class TransformerConfig(ModelConfig):
         # Configure blocks.
         block = TransformerBlockConfig(
             name=TransformerBlockType.normalized,
-            attention=AttentionConfig(
+            sequence_mixer=AttentionConfig(
                 name=AttentionType.normalized,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
@@ -1635,6 +1685,8 @@ class TransformerConfig(ModelConfig):
         n_kv_heads: int,
         hidden_size: int,
         head_dim: Optional[int] = None,
+        gate: Optional[GateConfig] = None,
+        activation: ActivationFunction = ActivationFunction.gelu_tanh,
         local_window_size: int = 1024,
         local_rope_theta: int = 10_000,
         global_rope_theta: int = 1_000_000,
@@ -1667,58 +1719,53 @@ class TransformerConfig(ModelConfig):
             dtype=dtype,
         )
 
-        pattern = [local_window_size] * (global_layer_interval - 1) + [-1]
-        sliding_window = SlidingWindowAttentionConfig(
-            pattern=pattern,
-            force_full_attention_on_first_layer=False,
-            force_full_attention_on_last_layer=False,
-        )
-
-        block = TransformerBlockConfig(
+        local_block = TransformerBlockConfig(
             name=TransformerBlockType.peri_norm,
-            attention=AttentionConfig(
+            sequence_mixer=AttentionConfig(
                 name=AttentionType.default,
                 n_heads=n_heads,
                 n_kv_heads=n_kv_heads,
                 head_dim=head_dim,
                 bias=False,
                 rope=RoPEConfig(name=RoPEType.default, theta=local_rope_theta),
+                gate=gate,
                 qk_norm=layer_norm,
                 use_head_qk_norm=True,
                 use_flash=use_flash,
                 backend=attn_backend,
-                sliding_window=sliding_window,
+                sliding_window=SlidingWindowAttentionConfig(
+                    pattern=[local_window_size],  # Always apply SWA on local_block
+                    force_full_attention_on_first_layer=False,
+                    force_full_attention_on_last_layer=False,
+                ),
                 dtype=dtype,
             ),
             feed_forward=FeedForwardConfig(
                 hidden_size=hidden_size,
                 bias=False,
                 dtype=dtype,
-                activation=ActivationFunction.gelu_tanh,
+                activation=activation,
             ),
             layer_norm=layer_norm,
         )
 
-        block_overrides: Dict[int, TransformerBlockConfig] = {}
-        for layer_idx in range(n_layers):
-            if not sliding_window.should_use_swa(layer_idx, n_layers):
-                global_block = block.copy()
-                global_block.attention = block.attention.copy()
-                global_block.attention.rope = RoPEConfig(
-                    name=RoPEType.default,
-                    theta=global_rope_theta,
-                )
-                global_block.attention.sliding_window = None
-                block_overrides[layer_idx] = global_block
+        global_block = local_block.copy()
+        sequence_mixer = cast(AttentionConfig, global_block.sequence_mixer.copy())
+        sequence_mixer.rope = RoPEConfig(name=RoPEType.default, theta=global_rope_theta)
+        sequence_mixer.sliding_window = None
+        global_block.sequence_mixer = sequence_mixer
+
+        blocks = {"local": local_block, "global": global_block}
+        block_pattern = ["local"] * (global_layer_interval - 1) + ["global"]
 
         return cls(
             d_model=d_model,
             vocab_size=vocab_size,
             n_layers=n_layers,
-            block=block,
+            block=blocks,
             lm_head=LMHeadConfig(layer_norm=layer_norm, bias=False, dtype=dtype),
             dtype=dtype,
-            block_overrides=block_overrides if block_overrides else None,
+            block_pattern=block_pattern,
             embed_scale=math.sqrt(d_model),
             **kwargs,
         )
@@ -1730,18 +1777,26 @@ class TransformerConfig(ModelConfig):
         Return a copy of this config with the given RoPE scaling scheme applied.
         """
         new_config = self.copy()
-        if new_config.block.attention.rope is None:
+        if isinstance(new_config.block, dict):
+            raise OLMoConfigurationError(
+                "Cannot use `with_rope_scaling` with a hybrid model with named blocks."
+            )
+        assert isinstance(
+            new_config.block.sequence_mixer, AttentionConfig
+        ), "Sequence mixer must be an attention config for RoPE scaling"
+        if new_config.block.sequence_mixer.rope is None:
             raise ValueError("Cannot apply RoPE scaling to a model without RoPE.")
         if new_config.block_overrides:
             raise ValueError("Cannot apply RoPE scaling when block_overrides are already set.")
 
         def apply_scaling(block_config: TransformerBlockConfig) -> None:
-            rope_config = block_config.attention.rope
+            assert isinstance(block_config.sequence_mixer, AttentionConfig)
+            rope_config = block_config.sequence_mixer.rope
             if rope_config is None:
                 raise ValueError("Cannot apply RoPE scaling to a layer without RoPE.")
             rope_config = rope_config.copy()
             rope_config.scaling = rope_scaling
-            block_config.attention.rope = rope_config
+            block_config.sequence_mixer.rope = rope_config
 
         if not full_attn_layers_only:
             apply_scaling(new_config.block)
@@ -1751,7 +1806,7 @@ class TransformerConfig(ModelConfig):
         # We supply "block_overrides" for the layers we want to scale.
         overrides: Dict[int, TransformerBlockConfig] = {}
         for i in range(new_config.n_layers):
-            sliding_window_cfg = new_config.block.attention.sliding_window
+            sliding_window_cfg = new_config.block.sequence_mixer.sliding_window
             if sliding_window_cfg and sliding_window_cfg.should_use_swa(i, new_config.n_layers):
                 continue
             block_copy = new_config.block.copy()
@@ -1760,3 +1815,68 @@ class TransformerConfig(ModelConfig):
 
         new_config.block_overrides = overrides or None
         return new_config
+
+
+def validate_block_resolution_config(
+    n_layers: int,
+    block: TransformerBlockConfig | dict[str, TransformerBlockConfig],
+    block_pattern: list[str] | None = None,
+    block_overrides: dict[int, TransformerBlockConfig] | None = None,
+) -> None:
+    if not isinstance(block, dict):
+        if block_pattern is not None:
+            raise OLMoConfigurationError(
+                "`block_pattern` is not supported when `block` is not a dict of named blocks."
+            )
+        return
+
+    if not block_pattern:
+        raise OLMoConfigurationError(
+            "`block_pattern` must be provided and non-empty when `block` is a dict of named blocks."
+        )
+    if block_overrides is not None:
+        raise OLMoConfigurationError(
+            "`block_overrides` is not supported when `block` is a dict of named blocks; "
+            "use `block_pattern` to control per-layer block selection."
+        )
+
+    available_block_names = set(block.keys())
+    missing_block_names = set(block_pattern) - available_block_names
+    if missing_block_names:
+        raise OLMoConfigurationError(
+            "Every name in `block_pattern` must exist in `block`. "
+            f"Unknown names: {missing_block_names}. Available names: {available_block_names}."
+        )
+
+
+def resolve_block_configs(
+    n_layers: int,
+    block: TransformerBlockConfig | dict[str, TransformerBlockConfig],
+    block_pattern: list[str] | None = None,
+    block_overrides: dict[int, TransformerBlockConfig] | None = None,
+) -> list[TransformerBlockConfig]:
+    """Resolve the block configuration for each layer."""
+    validate_block_resolution_config(
+        n_layers=n_layers,
+        block=block,
+        block_pattern=block_pattern,
+        block_overrides=block_overrides,
+    )
+
+    block_configs: list[TransformerBlockConfig]
+    if isinstance(block, dict):
+        # Named-block configuration.
+        assert block_pattern is not None
+        assert block_overrides is None
+        full_pattern = list(islice(cycle(block_pattern), n_layers))
+        block_configs = [block[name] for name in full_pattern]
+    else:
+        # Single-block with manual override configuration.
+        assert block_pattern is None
+        block_configs = [block] * n_layers
+        if block_overrides is not None:
+            for block_idx, override in block_overrides.items():
+                block_configs[block_idx] = override
+
+    assert len(block_configs) == n_layers
+    return block_configs

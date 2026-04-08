@@ -37,7 +37,12 @@ from olmo_core.nn.attention.ring import (
 )
 from olmo_core.utils import get_default_device, mark_dynamic, move_to_device
 
-from ..attention import Attention, FusedAttention, RingAttentionLoadBalancer
+from ..attention import (
+    Attention,
+    FusedAttention,
+    RingAttentionLoadBalancer,
+    SequenceMixer,
+)
 from ..buffer_cache import BufferCache
 from ..functional import l2_normalize
 from ..layer_norm import LayerNormConfig
@@ -55,6 +60,7 @@ from .config import (
     TransformerActivationCheckpointingMode,
     TransformerBlockConfig,
     TransformerDataParallelWrappingStrategy,
+    resolve_block_configs,
 )
 from .init import InitMethod
 
@@ -80,11 +86,17 @@ class Transformer(nn.Module):
     :param d_model: The model dimensionality.
     :param vocab_size: The vocab size.
     :param n_layers: The number of transformer layers/blocks.
-    :param block: The block configuration.
+    :param block: The block configuration. Can be a single block config or a dict of named blocks.
     :param layer_norm: The layer norm config for the final layer norm.
     :param bias: Whether to use a bias in the final linear layer.
     :param dtype: The datatype to use for the linear output layer.
     :param init_device: The device used when initializing parameters.
+    :param init_seed: The seed used when initializing parameters.
+    :param init_std: The standard deviation used when initializing parameters.
+    :param embedding_init_std: The standard deviation used when initializing the embeddings.
+    :param block_overrides: Overrides for specific blocks. Not supported if `block` is a dict of named blocks.
+    :param block_pattern: The pattern of blocks to use. Required if `block` is a dict of named blocks.
+    :param embed_scale: The scale factor for the embeddings.
     """
 
     def __init__(
@@ -93,7 +105,7 @@ class Transformer(nn.Module):
         d_model: int,
         vocab_size: int,
         n_layers: int,
-        block: TransformerBlockConfig,
+        block: TransformerBlockConfig | dict[str, TransformerBlockConfig],
         lm_head: LMHeadConfig,
         embedding_norm: Optional[LayerNormConfig] = None,
         dtype: torch.dtype = torch.float32,
@@ -101,7 +113,9 @@ class Transformer(nn.Module):
         init_device: str = "cpu",
         init_seed: int = 0,
         init_std: float = 0.02,
+        embedding_init_std: Optional[float] = None,
         block_overrides: Optional[Dict[int, TransformerBlockConfig]] = None,
+        block_pattern: Optional[List[str]] = None,
         embed_scale: Optional[float] = None,
     ):
         super().__init__()
@@ -111,7 +125,6 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.n_layers = n_layers
-        self.n_attn_heads = block.attention.n_heads
         self.dtype = dtype
         self.embed_scale = embed_scale
 
@@ -124,13 +137,18 @@ class Transformer(nn.Module):
                 init_device=init_device,
             )
         )
+
+        block_configs: List[TransformerBlockConfig] = resolve_block_configs(
+            n_layers=n_layers,
+            block=block,
+            block_pattern=block_pattern,
+            block_overrides=block_overrides,
+        )
+
         self.blocks = nn.ModuleDict()
         for block_idx in range(n_layers):
-            block_config = block
-            if block_overrides is not None and block_idx in block_overrides:
-                block_config = block_overrides[block_idx]
             self.blocks[str(block_idx)] = self._validate_block(
-                block_config.build(
+                block_configs[block_idx].build(
                     d_model=d_model,
                     block_idx=block_idx,
                     n_layers=n_layers,
@@ -146,6 +164,7 @@ class Transformer(nn.Module):
         self.init_method = InitMethod(init_method)
         self.init_seed = init_seed
         self.init_std = init_std
+        self.embedding_init_std = embedding_init_std
 
         self._cache = cache
         self._pp_enabled = False
@@ -221,8 +240,11 @@ class Transformer(nn.Module):
             device = self.device
         rope_buffers = {}
         for key, block in self.blocks.items():
-            rope = cast(Optional[RotaryEmbeddingBase], block.attention.rope)  # type: ignore
-            rope_buffers[int(key)] = None if rope is None else rope.get_buffers(seq_len, device)
+            if isinstance(block.attention, (Attention, FusedAttention)):
+                rope = cast(Optional[RotaryEmbeddingBase], block.attention.rope)
+                rope_buffers[int(key)] = None if rope is None else rope.get_buffers(seq_len, device)
+            else:
+                rope_buffers[int(key)] = None
         return rope_buffers
 
     @torch.no_grad()
@@ -260,7 +282,10 @@ class Transformer(nn.Module):
             self.init_method.init_embeddings(
                 self.embeddings,
                 d_model=self.d_model,
-                std=self.init_std,
+                embed_scale=self.embed_scale,
+                std=self.embedding_init_std
+                if self.embedding_init_std is not None
+                else self.init_std,
                 generator=generator,
             )
 
@@ -268,7 +293,7 @@ class Transformer(nn.Module):
             # This might fail if it's wrapped.
             #  assert isinstance(block, TransformerBlock)
             block = cast(TransformerBlock, block)
-            att = cast(Union[Attention, FusedAttention], block.attention)
+            att = cast(SequenceMixer, block.attention)
 
             # Attention weights.
             self.init_method.init_attention(
@@ -305,13 +330,14 @@ class Transformer(nn.Module):
                     generator=generator,
                 )
 
-            # Warm up attention backend cache.
-            if max_seq_len is not None and att.backend is not None:
-                att.backend.warmup_cache(max_seq_len, device)
+            if isinstance(att, (Attention, FusedAttention)):
+                # Warm up attention backend cache.
+                if max_seq_len is not None and att.backend is not None:
+                    att.backend.warmup_cache(max_seq_len, device)
 
-            # Warm up RoPE cache.
-            if max_seq_len is not None and att.rope is not None:
-                att.rope.warmup_cache(max_seq_len, device)
+                # Warm up RoPE cache.
+                if max_seq_len is not None and att.rope is not None:
+                    att.rope.warmup_cache(max_seq_len, device)
 
         if self.lm_head is not None:
             self.init_method.init_final_w_out(
@@ -920,14 +946,16 @@ class NormalizedTransformer(Transformer):
         d_model: int,
         vocab_size: int,
         n_layers: int,
-        block: TransformerBlockConfig,
+        block: TransformerBlockConfig | dict[str, TransformerBlockConfig],
         lm_head: LMHeadConfig,
         dtype: torch.dtype = torch.float32,
         init_method: InitMethod = InitMethod.normalized,
         init_device: str = "cpu",
         init_seed: int = 0,
         init_std: float = 0.02,
+        embedding_init_std: Optional[float] = None,
         block_overrides: Optional[Dict[int, TransformerBlockConfig]] = None,
+        block_pattern: Optional[List[str]] = None,
     ):
         super().__init__(
             d_model=d_model,
@@ -940,7 +968,9 @@ class NormalizedTransformer(Transformer):
             init_device=init_device,
             init_seed=init_seed,
             init_std=init_std,
+            embedding_init_std=embedding_init_std,
             block_overrides=block_overrides,
+            block_pattern=block_pattern,
         )
 
     def _validate_block(self, block: TransformerBlockBase) -> TransformerBlockBase:

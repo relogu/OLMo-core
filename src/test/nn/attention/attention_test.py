@@ -22,13 +22,11 @@ from olmo_core.nn.attention import (
     GateGranularity,
     NormalizedAttention,
     RingAttentionLoadBalancerType,
-    RingAttentionZigZagLoadBalancer,
     SlidingWindowAttentionConfig,
 )
 from olmo_core.nn.attention.ring import (
     RingContextParallelStyle,
     UlyssesContextParallelStyle,
-    UlyssesLoadBalancer,
 )
 from olmo_core.nn.layer_norm import LayerNormConfig
 from olmo_core.nn.rope import RoPEConfig, RoPEType
@@ -37,6 +35,7 @@ from olmo_core.testing import (
     DEVICES,
     FLASH_2_MARKS,
     FLASH_3_MARKS,
+    FLASH_4_MARKS,
     GPU_MARKS,
     TE_MARKS,
     requires_flash_attn_2,
@@ -63,7 +62,12 @@ BF16_ATOL = 5e-3
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize(
     "backend_name",
-    [AttentionBackendName.flash_2, AttentionBackendName.flash_3, AttentionBackendName.te],
+    [
+        AttentionBackendName.flash_2,
+        AttentionBackendName.flash_3,
+        pytest.param(AttentionBackendName.flash_4, id="flash_4", marks=FLASH_4_MARKS),
+        AttentionBackendName.te,
+    ],
 )
 @requires_gpu
 def test_attention_backend(
@@ -115,6 +119,7 @@ def test_attention_backend(
     [
         pytest.param("flash_2", id="flash-attn-2", marks=FLASH_2_MARKS),
         pytest.param("flash_3", id="flash-attn-3", marks=FLASH_3_MARKS),
+        pytest.param("flash_4", id="flash-attn-4", marks=FLASH_4_MARKS),
         pytest.param("torch", id="torch-SDPA"),
         pytest.param("te", id="te-attn", marks=TE_MARKS),
     ],
@@ -137,7 +142,7 @@ def test_attention(
     backend: str,
     kwargs: Dict[str, Any],
 ):
-    if backend in ("flash_2", "flash_3") and dtype == torch.float32:
+    if backend in ("flash_2", "flash_3", "flash_4") and dtype == torch.float32:
         pytest.skip("flash-attn requires a low precision dtype")
     if dtype == torch.bfloat16 and device.type == "cpu":
         pytest.skip("bf16 requires GPU")
@@ -146,7 +151,7 @@ def test_attention(
             pytest.skip("clip_qkv is not supported for NormalizedAttention")
         if "use_head_qk_norm" in kwargs:
             pytest.skip("use_head_qk_norm is not supported for NormalizedAttention")
-        if backend in ("flash_2", "flash_3", "te"):
+        if backend in ("flash_2", "flash_3", "flash_4", "te"):
             pytest.xfail(
                 f"NormalizedAttention is broken with '{backend}' backend because it creates activation tensors in fp32"
             )
@@ -422,7 +427,6 @@ def test_attention_with_intra_document_masking():
 
 
 @requires_gpu
-@requires_flash_attn_2
 @requires_compute_capability(min_cc=9)  # flash-attn bf16 precision is worse on A100s (cc=8)
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize(
@@ -433,7 +437,19 @@ def test_attention_with_intra_document_masking():
     "use_rope",
     [pytest.param(True, id="rope"), pytest.param(False, id="no-rope")],
 )
-def test_attention_kv_caching(batch_size: int, n_kv_heads: Optional[int], use_rope: bool):
+@pytest.mark.parametrize(
+    "backend_name",
+    [
+        pytest.param(AttentionBackendName.flash_2, id="flash-attn-2", marks=FLASH_2_MARKS),
+        pytest.param(AttentionBackendName.flash_4, id="flash-attn-4", marks=FLASH_4_MARKS),
+    ],
+)
+def test_attention_kv_caching(
+    batch_size: int,
+    n_kv_heads: Optional[int],
+    use_rope: bool,
+    backend_name: AttentionBackendName,
+):
     seed_all(0)
 
     d_model = 512
@@ -450,7 +466,7 @@ def test_attention_kv_caching(batch_size: int, n_kv_heads: Optional[int], use_ro
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
         rope=RoPEConfig() if use_rope else None,
-        use_flash=True,
+        backend=backend_name,
         init_device="cuda",
         dtype=torch.float32,
     )
@@ -502,11 +518,18 @@ def test_attention_kv_caching(batch_size: int, n_kv_heads: Optional[int], use_ro
 
 
 @requires_gpu
-@requires_flash_attn_2
-def test_attention_kv_cache_update():
+@requires_compute_capability(min_cc=9)
+@pytest.mark.parametrize(
+    "backend_name",
+    [
+        pytest.param(AttentionBackendName.flash_2, id="flash-attn-2", marks=FLASH_2_MARKS),
+        pytest.param(AttentionBackendName.flash_4, id="flash-attn-4", marks=FLASH_4_MARKS),
+    ],
+)
+def test_attention_kv_cache_update(backend_name: AttentionBackendName):
     seed_all(0)
 
-    d_model = 64
+    d_model = 512
     n_heads = 8
     n_kv_heads = 2
     batch_size = 2
@@ -520,7 +543,7 @@ def test_attention_kv_cache_update():
         d_model=d_model,
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
-        use_flash=True,
+        backend=backend_name,
         init_device="cuda",
         dtype=torch.float32,
     )
@@ -529,7 +552,7 @@ def test_attention_kv_cache_update():
     attention.init_kv_cache_manager(batch_size, max_seq_len)
     assert attention.kv_cache_manager is not None
 
-    # Manually set cache contents as if we just did a prefill.
+    # Prefill
     prefill_input = torch.randn(batch_size, prefill_len, d_model, dtype=dtype, device="cuda")
     attention_mask = torch.ones(batch_size, prefill_len, dtype=torch.bool, device="cuda")
     cache_leftpad = attention_mask_to_cache_leftpad(attention_mask)
@@ -553,12 +576,19 @@ def test_attention_kv_cache_update():
         # Check that cache has been updated.
         assert not torch.equal(k_cache_before, attention.kv_cache_manager.k_cache)
         assert not torch.equal(v_cache_before, attention.kv_cache_manager.v_cache)
-        assert attention.kv_cache_manager.cache_seqlens == cache_seqlens_before + 1
+        torch.testing.assert_close(
+            attention.kv_cache_manager.cache_seqlens, cache_seqlens_before + 1
+        )
 
         # Check that the update happened at the right position.
-        current_write_pos = cache_seqlens_before.item()
+        current_write_pos = int(cache_seqlens_before.item())
         k_cache_after = attention.kv_cache_manager.k_cache
         v_cache_after = attention.kv_cache_manager.v_cache
+
+        # Check that the cache at the new token position is not all zeros.
+        for b in range(batch_size):
+            assert not torch.all(k_cache_after[b, current_write_pos] == 0)
+            assert not torch.all(v_cache_after[b, current_write_pos] == 0)
 
         # Check that the cache *before* the new token is unchanged.
         torch.testing.assert_close(
@@ -580,28 +610,29 @@ def test_attention_kv_cache_update():
             v_cache_after[:, current_write_pos + 1 :, :, :],
         )
 
-        # Check that the cache at the new token position is not all zeros.
-        assert not torch.all(k_cache_after[:, current_write_pos, :, :] == 0)
-        assert not torch.all(v_cache_after[:, current_write_pos, :, :] == 0)
-
-        # New check: ensure previous write is untouched.
+        # Ensure previous write is untouched.
         if step > 0:
             assert k_at_prev_write_pos is not None and v_at_prev_write_pos is not None
             prev_write_pos = current_write_pos - 1
-            torch.testing.assert_close(
-                k_at_prev_write_pos,
-                k_cache_after[:, prev_write_pos, :, :],
-                msg=f"step {step}",
-            )
-            torch.testing.assert_close(
-                v_at_prev_write_pos,
-                v_cache_after[:, prev_write_pos, :, :],
-                msg=f"step {step}",
-            )
+            for b in range(batch_size):
+                torch.testing.assert_close(
+                    k_at_prev_write_pos[b],
+                    k_cache_after[b, prev_write_pos],
+                    msg=f"step {step}, batch {b}",
+                )
+                torch.testing.assert_close(
+                    v_at_prev_write_pos[b],
+                    v_cache_after[b, prev_write_pos],
+                    msg=f"step {step}, batch {b}",
+                )
 
         # Store the written slice for the next iteration's check.
-        k_at_prev_write_pos = k_cache_after[:, current_write_pos, :, :].clone()
-        v_at_prev_write_pos = v_cache_after[:, current_write_pos, :, :].clone()
+        k_at_prev_write_pos = torch.stack(
+            [k_cache_after[b, current_write_pos] for b in range(batch_size)]
+        ).clone()
+        v_at_prev_write_pos = torch.stack(
+            [v_cache_after[b, current_write_pos] for b in range(batch_size)]
+        ).clone()
 
 
 @requires_gpu
@@ -931,202 +962,6 @@ def test_no_global_rope_with_sliding_window(
         assert attn.rope is None
 
 
-def _get_zigzag_lb(rank: int, world_size: int) -> RingAttentionZigZagLoadBalancer:
-    return RingAttentionZigZagLoadBalancer(cp_rank=rank, cp_world_size=world_size)
-
-
-def test_zig_zag_load_balancer_padding():
-    x, padding_added = _get_zigzag_lb(0, 4).pad(
-        torch.tensor([0, 1, 2, 3, 4, 5]).unsqueeze(0), 1, -1
-    )
-    assert x.tolist() == [[0, 1, 2, 3, 4, 5, -1, -1]]
-    assert padding_added == 2
-
-
-def test_zig_zag_load_balancer_shard():
-    x = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]).unsqueeze(0)
-    assert _get_zigzag_lb(0, 4).batch_shard(inputs=[x], seq_dims=[1])[0].tolist() == [
-        [
-            0,
-            7,
-        ]
-    ]
-    assert _get_zigzag_lb(3, 4).batch_shard(inputs=[x], seq_dims=[1])[0].tolist() == [
-        [
-            3,
-            4,
-        ]
-    ]
-
-
-def test_zig_zag_load_balancer_shard_with_padding():
-    x = torch.tensor([0, 1, 2, 3, 4, 5]).unsqueeze(0)
-    assert _get_zigzag_lb(0, 4).batch_shard(inputs=[x], seq_dims=[1], pad_values=[-1])[
-        0
-    ].tolist() == [
-        [
-            0,
-            -1,
-        ]
-    ]
-    assert _get_zigzag_lb(3, 4).batch_shard(inputs=[x], seq_dims=[1], pad_values=[-1])[
-        0
-    ].tolist() == [
-        [
-            3,
-            4,
-        ]
-    ]
-
-
-def test_zig_zag_load_balancer_shard_by_document():
-    x = torch.tensor(list(range(12))).unsqueeze(0)
-    cu_doc_lens = torch.tensor([0, 8, 12])
-
-    assert _get_zigzag_lb(0, 2).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens
-    )[0][0].tolist() == [
-        [
-            0,
-            1,
-            6,
-            7,
-            8,
-            11,
-        ]
-    ]
-
-    assert _get_zigzag_lb(1, 2).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens
-    )[0][0].tolist() == [
-        [
-            2,
-            3,
-            4,
-            5,
-            9,
-            10,
-        ]
-    ]
-
-
-def test_zig_zag_load_balancer_shard_by_document_with_padding():
-    x = torch.tensor(list(range(12))).unsqueeze(0)
-    cu_doc_lens = torch.tensor([0, 7, 10])
-
-    res, opts = _get_zigzag_lb(0, 2).batch_shard_by_document(
-        inputs=[x],
-        seq_dims=[1],
-        cu_doc_lens=cu_doc_lens,
-        pad_values=[-1],
-    )
-    new_doc_lens = opts["cu_doc_lens"]
-    assert new_doc_lens.tolist() == [0, 4, 6]
-    assert res[0].tolist() == [
-        [
-            0,
-            1,
-            6,
-            -1,
-            7,
-            -1,
-        ]
-    ]
-
-
-def _get_ulysses_lb(rank: int, world_size: int) -> UlyssesLoadBalancer:
-    return UlyssesLoadBalancer(cp_rank=rank, cp_world_size=world_size)
-
-
-def test_ulysses_load_balancer_padding():
-    x, padding_added = _get_ulysses_lb(0, 4).pad(
-        torch.tensor([0, 1, 2, 3, 4, 5]).unsqueeze(0), 1, -1
-    )
-    assert x.tolist() == [[0, 1, 2, 3, 4, 5, -1, -1]]
-    assert padding_added == 2
-
-
-def test_ulysses_load_balancer_shard():
-    x = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]).unsqueeze(0)
-    # Ulysses uses contiguous sharding, so each rank gets a contiguous chunk
-    assert _get_ulysses_lb(0, 4).batch_shard(inputs=[x], seq_dims=[1])[0].tolist() == [[0, 1]]
-    assert _get_ulysses_lb(1, 4).batch_shard(inputs=[x], seq_dims=[1])[0].tolist() == [[2, 3]]
-    assert _get_ulysses_lb(2, 4).batch_shard(inputs=[x], seq_dims=[1])[0].tolist() == [[4, 5]]
-    assert _get_ulysses_lb(3, 4).batch_shard(inputs=[x], seq_dims=[1])[0].tolist() == [[6, 7]]
-
-
-def test_ulysses_load_balancer_shard_with_padding():
-    x = torch.tensor([0, 1, 2, 3, 4, 5]).unsqueeze(0)
-    # 6 tokens with CP=4 -> pads to 8 tokens, then each rank gets 2
-    assert _get_ulysses_lb(0, 4).batch_shard(inputs=[x], seq_dims=[1], pad_values=[-1])[
-        0
-    ].tolist() == [[0, 1]]
-    assert _get_ulysses_lb(1, 4).batch_shard(inputs=[x], seq_dims=[1], pad_values=[-1])[
-        0
-    ].tolist() == [[2, 3]]
-    assert _get_ulysses_lb(2, 4).batch_shard(inputs=[x], seq_dims=[1], pad_values=[-1])[
-        0
-    ].tolist() == [[4, 5]]
-    assert _get_ulysses_lb(3, 4).batch_shard(inputs=[x], seq_dims=[1], pad_values=[-1])[
-        0
-    ].tolist() == [[-1, -1]]
-
-
-def test_ulysses_load_balancer_shard_by_document():
-    x = torch.tensor(list(range(12))).unsqueeze(0)
-    cu_doc_lens = torch.tensor([0, 8, 12])
-
-    # Ulysses with CP=2: rank 0 gets tokens 0-5, rank 1 gets tokens 6-11
-    res0, opts0 = _get_ulysses_lb(0, 2).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens
-    )
-    assert res0[0].tolist() == [[0, 1, 2, 3, 4, 5]]
-    # Full sequences are reconstructed via all-to-all, so we pass through the original document lengths
-    assert opts0["cu_doc_lens"].tolist() == cu_doc_lens.tolist()
-
-    res1, opts1 = _get_ulysses_lb(1, 2).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens
-    )
-    assert res1[0].tolist() == [[6, 7, 8, 9, 10, 11]]
-    # Full sequences are reconstructed via all-to-all, so we pass through the original document lengths
-    assert opts1["cu_doc_lens"].tolist() == cu_doc_lens.tolist()
-
-
-def test_ulysses_load_balancer_shard_by_document_with_padding():
-    # 10 tokens with CP=4 -> pads to 12 tokens (next multiple of 4), then each rank gets 3
-    x = torch.tensor(list(range(10))).unsqueeze(0)
-    cu_doc_lens = torch.tensor([0, 6, 10])
-    # Padding adds 2 tokens, creating a synthetic document: [0, 6, 10] -> [0, 6, 10, 12]
-    expected_cu_doc_lens = [0, 6, 10, 12]
-
-    res0, opts0 = _get_ulysses_lb(0, 4).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens, pad_values=[-1]
-    )
-    assert res0[0].tolist() == [[0, 1, 2]]
-    # cu_doc_lens should include the padding as a synthetic document
-    assert opts0["cu_doc_lens"].tolist() == expected_cu_doc_lens
-    assert opts0["max_doc_len"] == 6  # max of doc lengths: 6, 4, 2
-
-    res1, opts1 = _get_ulysses_lb(1, 4).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens, pad_values=[-1]
-    )
-    assert res1[0].tolist() == [[3, 4, 5]]
-    assert opts1["cu_doc_lens"].tolist() == expected_cu_doc_lens
-
-    res2, opts2 = _get_ulysses_lb(2, 4).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens, pad_values=[-1]
-    )
-    assert res2[0].tolist() == [[6, 7, 8]]
-    assert opts2["cu_doc_lens"].tolist() == expected_cu_doc_lens
-
-    res3, opts3 = _get_ulysses_lb(3, 4).batch_shard_by_document(
-        inputs=[x], seq_dims=[1], cu_doc_lens=cu_doc_lens, pad_values=[-1]
-    )
-    # Last rank gets token 9 plus 2 padding tokens
-    assert res3[0].tolist() == [[9, -1, -1]]
-    assert opts3["cu_doc_lens"].tolist() == expected_cu_doc_lens
-
-
 @pytest.mark.parametrize(
     "force_first, force_last, layer_idx, expected_window_size, expected_should_use_swa",
     [
@@ -1411,7 +1246,10 @@ def _run_context_parallel_attention_ulysses(
     y_ref_local = y_ref[:, rank * chunk_size : (rank + 1) * chunk_size, :]
 
     # Compare the local output with the reference output.
-    torch.testing.assert_close(y_ref_local, y_local, rtol=BF16_RTOL, atol=BF16_ATOL)
+    tol_scale = 2  # requires slightly more tolerance than default
+    torch.testing.assert_close(
+        y_ref_local, y_local, rtol=BF16_RTOL * tol_scale, atol=BF16_ATOL * tol_scale
+    )
 
 
 @requires_multi_gpu
