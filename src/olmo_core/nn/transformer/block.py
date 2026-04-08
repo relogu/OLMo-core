@@ -14,6 +14,7 @@ from olmo_core.distributed.utils import get_local_tensor
 from olmo_core.doc_utils import beta_feature
 from olmo_core.ops import attach_auxiliary_loss
 
+from ..attention import AttentionConfig
 from ..attention.base import SequenceMixerConfig
 from ..attention.ring import RingContextParallelStyle, UlyssesContextParallelStyle
 from ..buffer_cache import BufferCache
