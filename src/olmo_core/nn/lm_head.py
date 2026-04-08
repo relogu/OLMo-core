@@ -19,7 +19,6 @@ from olmo_core.config import DType, StrEnum
 from olmo_core.distributed.utils import get_local_tensor
 from olmo_core.doc_utils import beta_feature
 from olmo_core.exceptions import OLMoConfigurationError
-
 from .config import ModuleConfig
 from .functional import (
     cross_entropy_loss,

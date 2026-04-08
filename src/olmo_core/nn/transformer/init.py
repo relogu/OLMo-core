@@ -161,14 +161,21 @@ class InitMethod(StrEnum):
 
         # Compute std for w3 initialization
         if self == InitMethod.fan_in:
-            # For fan_in, w3 uses 1/√d_in where d_in = d_model
-            std = m.w3.in_features**-0.5
+            # For fan_in, w3 uses 1/√d_in where d_in = d_model. Some
+            # feed-forward variants do not define ``w3``, so only compute that
+            # projection-specific std when it actually exists.
+            if hasattr(m, "w3"):
+                std = m.w3.in_features**-0.5
         elif self == InitMethod.llama:
             std = std / (2 * num_blocks) ** 0.5
         elif self == InitMethod.llama_depth:
             std = std / (2 * (block_idx + 1)) ** 0.5
 
-        init_linear(m.w3, std=std, generator=generator)
+        # Some FeedForward implementations (e.g. UngatedFeedForward) do not
+        # provide a third linear matrix `w3`. Preserve main's fan-in handling
+        # while guarding that optional projection for older variants.
+        if hasattr(m, "w3"):
+            init_linear(m.w3, std=std, generator=generator)
 
         # Compute std for w2 initialization
         if self == InitMethod.fan_in:

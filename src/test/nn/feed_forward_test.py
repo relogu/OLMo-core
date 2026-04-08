@@ -96,7 +96,14 @@ def test_feed_forward_num_flops_per_token():
     )
 
 
-@pytest.mark.parametrize("activation", [ActivationFunction.silu, ActivationFunction.gelu_tanh])
+@pytest.mark.parametrize(
+    "activation",
+    [
+        ActivationFunction.silu,
+        ActivationFunction.gelu_tanh,
+        ActivationFunction.relu2,
+    ],
+)
 def test_feed_forward_activations(activation: ActivationFunction):
     seed_all(0)
     d_model = 128

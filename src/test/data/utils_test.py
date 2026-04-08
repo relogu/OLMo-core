@@ -1,3 +1,4 @@
+import gzip
 from collections import namedtuple
 
 import numpy as np
@@ -81,6 +82,29 @@ def test_iter_document_indices_with_bos_token_id(tmp_path, bos_token_id: int, eo
             use_array_if_local=True,
         )
     ) == [(0, 9), (9, len(data))]
+
+
+def test_pack_documents_into_instances_uses_metadata_when_array_inference_disabled(tmp_path):
+    data = [11, 99, 12, 13, 99]
+    data_path = tmp_path / "data.npy"
+    mmap = np.memmap(data_path, mode="w+", dtype=np.uint16, shape=(len(data),))
+    mmap[:] = data
+    mmap.flush()
+    with gzip.open(data_path.with_suffix(".csv.gz"), "wt", encoding="utf-8") as handle:
+        handle.write("0,5\n")
+
+    instances, document_indices, total_tokens = pack_documents_into_instances(
+        data_path,
+        max_sequence_length=8,
+        eos_token_id=99,
+        bos_token_id=1,
+        use_array_if_local=False,
+        dtype=np.uint16,
+    )
+
+    assert instances == [[0]]
+    assert document_indices.tolist() == [[0, 5]]
+    assert total_tokens == 5
 
 
 def test_melt_batch():
